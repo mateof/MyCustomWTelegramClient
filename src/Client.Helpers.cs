@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Buffers;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -42,34 +44,55 @@ namespace WTelegram
 				int file_total_parts = hasLength ? (int)((length - 1) / FilePartSize) + 1 : -1;
 				long file_id = Helpers.RandomLong();
 				int file_part = 0, read;
-				var tasks = new Dictionary<int, Task>();
+				var tasks = new ConcurrentDictionary<int, Task>();
 				bool abort = false;
+				DateTime lastPartTime = DateTime.MinValue;
 				for (long bytesLeft = hasLength ? length : long.MaxValue; !abort && bytesLeft != 0; file_part++)
 				{
-					var bytes = new byte[Math.Min(FilePartSize, bytesLeft)];
-					read = await stream.FullReadAsync(bytes, bytes.Length, default);
-					await _parallelTransfers.WaitAsync();
-					bytesLeft -= read;
-					if (!hasLength && read < bytes.Length)
+					int partSize = (int)Math.Min(FilePartSize, bytesLeft);
+					byte[] bytes = ArrayPool<byte>.Shared.Rent(partSize);
+					try
 					{
-						file_total_parts = file_part;
-						if (read == 0) break; else file_total_parts++;
-						bytes = bytes[..read]; 
-						bytesLeft = 0; 
+						read = await stream.FullReadAsync(bytes, partSize, default);
+						await _parallelTransfers.WaitAsync();
+						bytesLeft -= read;
+						if (!hasLength && read < partSize)
+						{
+							file_total_parts = file_part;
+							if (read == 0) { ArrayPool<byte>.Shared.Return(bytes); break; }
+							file_total_parts++;
+							bytesLeft = 0;
+						}
+						// Rate limiting to avoid FLOOD_WAIT
+						if (TransferDelayMs > 0)
+						{
+							var elapsed = (DateTime.UtcNow - lastPartTime).TotalMilliseconds;
+							if (elapsed < TransferDelayMs)
+								await Task.Delay(TransferDelayMs - (int)elapsed);
+							lastPartTime = DateTime.UtcNow;
+						}
+						// Copy only the bytes we need (ArrayPool may return larger buffer)
+						var bytesToSend = read == bytes.Length ? bytes : bytes[..read];
+						var task = SavePart(file_part, bytesToSend, bytes);
+						tasks.TryAdd(file_part, task);
+						if (read < FilePartSize && bytesLeft != 0) throw new WTException($"Failed to fully read stream ({read},{bytesLeft})");
 					}
-					var task = SavePart(file_part, bytes);
-					lock (tasks) tasks[file_part] = task;
-					if (read < FilePartSize && bytesLeft != 0) throw new WTException($"Failed to fully read stream ({read},{bytesLeft})");
+					catch
+					{
+						ArrayPool<byte>.Shared.Return(bytes);
+						throw;
+					}
 
-					async Task SavePart(int file_part, byte[] bytes)
+					async Task SavePart(int file_part, byte[] bytesToSend, byte[] rentedBuffer)
 					{
 						try
 						{
 							if (isBig)
-								await client.Upload_SaveBigFilePart(file_id, file_part, file_total_parts, bytes);
+								await client.Upload_SaveBigFilePart(file_id, file_part, file_total_parts, bytesToSend);
 							else
-								await client.Upload_SaveFilePart(file_id, file_part, bytes);
-							lock (tasks) { transmitted += bytes.Length; tasks.Remove(file_part); }
+								await client.Upload_SaveFilePart(file_id, file_part, bytesToSend);
+							Interlocked.Add(ref transmitted, bytesToSend.Length);
+							tasks.TryRemove(file_part, out _);
 							progress?.Invoke(transmitted, length);
 						}
 						catch (Exception)
@@ -79,13 +102,12 @@ namespace WTelegram
 						}
 						finally
 						{
+							ArrayPool<byte>.Shared.Return(rentedBuffer);
 							_parallelTransfers.Release();
 						}
 					}
 				}
-				Task[] remainingTasks;
-				lock (tasks) remainingTasks = [.. tasks.Values];
-				await Task.WhenAll(remainingTasks); // wait completion and eventually propagate any task exception
+				await Task.WhenAll(tasks.Values); // wait completion and eventually propagate any task exception
 				return isBig ? new InputFileBig { id = file_id, parts = file_total_parts, name = filename }
 					: new InputFile { id = file_id, parts = file_total_parts, name = filename };
 			}
@@ -389,14 +411,23 @@ namespace WTelegram
 			long streamStartPos = canSeek ? outputStream.Position : 0;
 			long fileOffset = 0, maxOffsetSeen = 0;
 			long transmitted = 0;
-			var tasks = new Dictionary<long, Task>();
+			var tasks = new ConcurrentDictionary<long, Task>();
 			progress?.Invoke(0, fileSize);
 			bool abort = false;
+			DateTime lastPartTime = DateTime.MinValue;
 			while (!abort)
 			{
 				await _parallelTransfers.WaitAsync();
+				// Rate limiting to avoid FLOOD_WAIT
+				if (TransferDelayMs > 0)
+				{
+					var elapsed = (DateTime.UtcNow - lastPartTime).TotalMilliseconds;
+					if (elapsed < TransferDelayMs)
+						await Task.Delay(TransferDelayMs - (int)elapsed);
+					lastPartTime = DateTime.UtcNow;
+				}
 				var task = LoadPart(fileOffset);
-				lock (tasks) tasks[fileOffset] = task;
+				tasks.TryAdd(fileOffset, task);
 				if (dc_id == 0) { await task; dc_id = client._dcSession.DcID; }
 				if (!canSeek) await task;
 				fileOffset += FilePartSize;
@@ -449,7 +480,7 @@ namespace WTelegram
 							}
 							await outputStream.WriteAsync(fileData.bytes, 0, fileData.bytes.Length);
 							maxOffsetSeen = Math.Max(maxOffsetSeen, offset + fileData.bytes.Length);
-							transmitted += fileData.bytes.Length;
+							Interlocked.Add(ref transmitted, fileData.bytes.Length);
 							progress?.Invoke(transmitted, fileSize);
 						}
 						catch (Exception)
@@ -462,13 +493,11 @@ namespace WTelegram
 							writeSem.Release();
 						}
 					}
-					lock (tasks) tasks.Remove(offset);
+					tasks.TryRemove(offset, out _);
 					return fileData.bytes.Length;
 				}
 			}
-			Task[] remainingTasks;
-			lock (tasks) remainingTasks = [.. tasks.Values];
-			await Task.WhenAll(remainingTasks); // wait completion and eventually propagate any task exception
+			await Task.WhenAll(tasks.Values); // wait completion and eventually propagate any task exception
 			await outputStream.FlushAsync();
 			if (canSeek) outputStream.Seek(streamStartPos + maxOffsetSeen, SeekOrigin.Begin);
 			return fileType;

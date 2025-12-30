@@ -48,8 +48,10 @@ namespace WTelegram
 		public int FloodRetryThreshold { get; set; } = 60;
 		/// <summary>Number of seconds between each keep-alive ping. Increase this if you have a slow connection or you're debugging your code</summary>
 		public int PingInterval { get; set; } = 60;
-		/// <summary>Size of chunks when uploading/downloading files. Reduce this if you don't have much memory</summary>
+		/// <summary>Size of chunks when uploading/downloading files. Reduce this if you don't have much memory. Default: 512KB. Max recommended: 1MB</summary>
 		public int FilePartSize { get; set; } = 512 * 1024;
+		/// <summary>Minimum delay in milliseconds between upload/download part requests to avoid FLOOD_WAIT. Set to 0 to disable. Default: 20ms</summary>
+		public int TransferDelayMs { get; set; } = 20;
 		/// <summary>Is this Client instance the main or a secondary DC session</summary>
 		public bool IsMainDC => _dcSession?.DataCenter?.flags.HasFlag(DcOption.Flags.media_only) != true
 			&& (_dcSession?.DataCenter?.id - _session.MainDC) is null or 0;
@@ -95,7 +97,7 @@ namespace WTelegram
 		private int _reactorReconnects = 0;
 		private const string ConnectionShutDown = "Could not read payload length : Connection shut down";
 		private const long Ticks5Secs = 5 * TimeSpan.TicksPerSecond;
-		private readonly SemaphoreSlim _parallelTransfers = new(2); // max parallel part uploads/downloads
+		private readonly SemaphoreSlim _parallelTransfers = new(3); // max parallel part uploads/downloads (conservative to avoid FLOOD_WAIT)
 		private readonly SHA256 _sha256 = SHA256.Create();
 		private readonly SHA256 _sha256Recv = SHA256.Create();
 #if OBFUSCATION
@@ -837,6 +839,15 @@ namespace WTelegram
 		static async Task<TcpClient> DefaultTcpHandler(string host, int port)
 		{
 			var tcpClient = new TcpClient();
+			// Disable Nagle algorithm for lower latency (critical for many small RPC calls)
+			tcpClient.NoDelay = true;
+			// Increase socket buffers for better throughput
+			try
+			{
+				tcpClient.SendBufferSize = 256 * 1024;    // 256KB (default is typically 8KB)
+				tcpClient.ReceiveBufferSize = 256 * 1024; // 256KB
+			}
+			catch { } // Some platforms may not allow changing buffer sizes
 			await tcpClient.ConnectAsync(host, port);
 			return tcpClient;
 		}
